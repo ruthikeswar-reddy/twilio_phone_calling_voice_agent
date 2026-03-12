@@ -1,0 +1,31 @@
+# ── Web Framework ────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+uvloop>=0.19.0
+websockets>=12.0
+httpx>=0.27.0
+python-multipart>=0.0.9
+
+# ── Config ───────────────────────────────────────────────
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# ── LangGraph / LangChain ────────────────────────────────
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+langchain-anthropic>=0.1.0
+
+# ── STT ──────────────────────────────────────────────────
+deepgram-sdk>=3.4.0
+
+# ── Audio ────────────────────────────────────────────────
+numpy>=1.26.0
+# audioop was removed in Python 3.13. audioop-lts is a drop-in replacement.
+# On Python <= 3.12, stdlib audioop takes precedence (no conflict).
+audioop-lts>=0.2.1
+
+# ── Monitoring / Logging ─────────────────────────────────
+structlog>=24.0.0
