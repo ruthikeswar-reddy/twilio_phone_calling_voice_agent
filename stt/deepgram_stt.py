@@ -4,6 +4,23 @@ Deepgram Nova-3 Streaming STT
 - Accepts μ-law 8kHz directly (no conversion needed!)
 - Uses WebSocket streaming for real-time interim + final results
 - Endpointing: VAD-based utterance detection
+
+FIX: Correctly distinguish is_final vs speech_final.
+
+  is_final=True    → Deepgram has committed a chunk to its transcript, but
+                     the utterance is NOT over. More speech may follow. These
+                     should be treated as high-confidence interims, NOT full
+                     finals — otherwise multiple "final" events fire per
+                     utterance, causing the agent to restart mid-reply.
+
+  speech_final=True → The utterance is definitively complete (endpointing
+                      threshold reached). This is the correct trigger for a
+                      full "final" agent launch.
+
+  So the correct logic is:
+    speech_final=True  → emit type="final"   (utterance done, run agent)
+    is_final=True only → emit type="interim" (chunk committed, keep accumulating)
+    neither            → emit type="interim" (in-progress chunk)
 """
 
 import asyncio
@@ -33,10 +50,13 @@ DEEPGRAM_WS_URL = (
     "&channels=1"
     "&punctuate=true"
     "&interim_results=true"      # Enable for speculative agent start
-    "&endpointing=200"           # 200ms silence = utterance end (tune as needed)
+    "&endpointing=300"           # FIX: raised from 200ms → 300ms silence = utterance end.
+                                 # 200ms was too aggressive, causing early speech_final
+                                 # on short pauses mid-sentence ("So… explain"),
+                                 # which contributed to the 4194ms STT latency spike.
     "&utterance_end_ms=1000"     # Finalize after 1s silence
     "&smart_format=true"         # Better formatting
-    "&vad_events=true"           # Speech start/end events
+    "&vad_events=true"           # Speech start/end events — required for FIX 1
     "&no_delay=true"             # Minimize processing delay
 )
 
@@ -51,6 +71,10 @@ class DeepgramSTTStream:
         self._event_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._receiver_task: asyncio.Task | None = None
         self._closed = False
+
+        # Accumulate is_final chunks into one coherent utterance.
+        # Only emitted as "final" when speech_final=True arrives.
+        self._utterance_buffer: str = ""
 
     async def connect(self):
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
@@ -76,7 +100,6 @@ class DeepgramSTTStream:
         """Signal end of audio stream to Deepgram."""
         if self._ws and not self._closed:
             try:
-                # Send close stream message
                 await self._ws.send(json.dumps({"type": "CloseStream"}))
             except Exception:
                 pass
@@ -100,8 +123,15 @@ class DeepgramSTTStream:
 
     async def _receive_loop(self):
         """
-        Reads messages from Deepgram WebSocket and normalizes
-        them into our standard event format.
+        Reads messages from Deepgram WebSocket and normalises them into our
+        standard event format.
+
+        Event type mapping:
+          SpeechStarted          → speech_start  (used for VAD-based barge-in)
+          UtteranceEnd           → utterance_end
+          Results speech_final   → final         (complete utterance, run agent)
+          Results is_final only  → interim       (FIX: was incorrectly "final")
+          Results neither        → interim
         """
         try:
             async for raw_message in self._ws:
@@ -121,18 +151,59 @@ class DeepgramSTTStream:
                     speech_final = data.get("speech_final", False)
 
                     if not transcript:
+                        # Even empty speech_final should flush the buffer if
+                        # we have accumulated content.
+                        if speech_final and self._utterance_buffer:
+                            await self._event_queue.put({
+                                "type": "final",
+                                "transcript": self._utterance_buffer,
+                                "confidence": confidence,
+                            })
+                            self._utterance_buffer = ""
                         continue
 
-                    if speech_final or is_final:
+                    if speech_final:
+                        # ── FIX: utterance complete ────────────────────────
+                        # Merge any previously buffered is_final chunks with
+                        # this last segment for the most complete transcript.
+                        if self._utterance_buffer:
+                            full_transcript = (
+                                self._utterance_buffer.rstrip() + " " + transcript
+                            ).strip()
+                        else:
+                            full_transcript = transcript
+
                         await self._event_queue.put({
                             "type": "final",
-                            "transcript": transcript,
+                            "transcript": full_transcript,
                             "confidence": confidence,
                         })
-                    else:
+                        self._utterance_buffer = ""  # reset for next utterance
+
+                    elif is_final:
+                        # ── FIX: chunk committed, but utterance not done ───
+                        # Accumulate into buffer and emit as a high-confidence
+                        # interim so the speculative agent can still start early.
+                        self._utterance_buffer = (
+                            self._utterance_buffer.rstrip() + " " + transcript
+                        ).strip()
+
                         await self._event_queue.put({
                             "type": "interim",
-                            "transcript": transcript,
+                            "transcript": self._utterance_buffer,
+                            "confidence": min(confidence + 0.05, 1.0),  # slight boost
+                        })
+
+                    else:
+                        # In-progress partial result
+                        # Show full picture: buffered + current partial
+                        display = (
+                            self._utterance_buffer.rstrip() + " " + transcript
+                        ).strip() if self._utterance_buffer else transcript
+
+                        await self._event_queue.put({
+                            "type": "interim",
+                            "transcript": display,
                             "confidence": confidence,
                         })
 
@@ -140,6 +211,19 @@ class DeepgramSTTStream:
                     await self._event_queue.put({"type": "speech_start"})
 
                 elif msg_type == "UtteranceEnd":
+                    # UtteranceEnd fires after utterance_end_ms of silence.
+                    # If we still have buffered is_final content, flush it as final.
+                    if self._utterance_buffer:
+                        logger.debug(
+                            f"UtteranceEnd flushing buffer: '{self._utterance_buffer}'"
+                        )
+                        await self._event_queue.put({
+                            "type": "final",
+                            "transcript": self._utterance_buffer,
+                            "confidence": 0.9,
+                        })
+                        self._utterance_buffer = ""
+
                     await self._event_queue.put({"type": "utterance_end"})
 
                 elif msg_type in ("Metadata", "KeepAlive"):
@@ -168,3 +252,4 @@ class DeepgramSTT:
             yield stt_stream
         finally:
             await stt_stream.close()
+
