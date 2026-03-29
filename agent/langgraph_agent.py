@@ -20,6 +20,8 @@ from typing import Annotated, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
+from langchain_anthropic import ChatAnthropic
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
@@ -40,13 +42,22 @@ class AgentState(TypedDict):
 # ─────────────────────────────────────────────────────────────
 
 def _build_llm():
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
 
-    if provider == "openai":
-        return ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),   # Fast, cheap, great for voice
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        return ChatGroq(
+            model=os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),  # Fastest high-quality
             temperature=0.7,
-            max_tokens=300,         # Keep responses short for voice
+            max_tokens=300,
+            streaming=True,
+            api_key=os.getenv("GROQ_API_KEY"),
+        )
+    elif provider == "openai":
+        return ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.7,
+            max_tokens=300,
             streaming=True,
             api_key=os.getenv("OPENAI_API_KEY"),
         )
