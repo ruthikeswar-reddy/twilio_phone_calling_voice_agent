@@ -49,6 +49,7 @@ from fastapi import WebSocket
 from stt.deepgram_stt import DeepgramSTT
 from tts.cartesia_tts import CartesiaTTS
 from agent.langgraph_agent import LangGraphAgent
+from agent.customer_support_agent import CustomerSupportAgent
 from audio_utils import ulaw_to_pcm, pcm_to_ulaw
 
 logger = logging.getLogger(__name__)
@@ -313,6 +314,30 @@ class VoicePipeline:
             agent_start = time.monotonic()
             first_token = True
 
+# this is for normal langgraph agent
+            # async for text_chunk in self.agent.stream(transcript):
+            #     if first_token:
+            #         logger.info(
+            #             f"First LLM token: "
+            #             f"{(time.monotonic()-agent_start)*1000:.0f}ms"
+            #         )
+            #         first_token = False
+            #         # FIX 5: once the first LLM token arrives we've committed
+            #         # to this response — clear the speculative flag so a
+            #         # late-arriving final transcript cannot cancel us.
+            #         self._is_speculative_active = False
+            # Customer support agent (uncomment to use)
+            # async for text_chunk in self.customer_support_agent.stream(transcript, self.call_sid):
+            #     if first_token:
+            #         logger.info(
+            #             f"First LLM token: "
+            #             f"{(time.monotonic()-agent_start)*1000:.0f}ms"
+            #         )
+            #         first_token = False
+            #         self._is_speculative_active = False
+            #     await self._tts_text_queue.put(text_chunk)
+
+            # Default: General agent
             async for text_chunk in self.agent.stream(transcript):
                 if first_token:
                     logger.info(
@@ -320,11 +345,7 @@ class VoicePipeline:
                         f"{(time.monotonic()-agent_start)*1000:.0f}ms"
                     )
                     first_token = False
-                    # FIX 5: once the first LLM token arrives we've committed
-                    # to this response — clear the speculative flag so a
-                    # late-arriving final transcript cannot cancel us.
                     self._is_speculative_active = False
-
                 await self._tts_text_queue.put(text_chunk)
 
             await self._tts_text_queue.put(None)
