@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Annotated, Dict, List, Optional, TypedDict, Any 
+from typing import Annotated, Dict, List, Optional, TypedDict, Any, AsyncIterator 
 
 from pydantic import BaseModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -19,32 +19,76 @@ logger = logging.getLogger(__name__)
 # LLM
 # ============================================================
 
-def get_llm():
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+def get_streaming_llm():
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
     if provider == "groq":
         return ChatGroq(
             model=os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),
-            temperature=0,
-            max_tokens=200,
+            temperature=0.1,
+            max_tokens=300,
+            streaming=True,
             api_key=os.getenv("GROQ_API_KEY"),
         )
     elif provider == "openai":
         return ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            temperature=0,
-            max_tokens=200,
+            temperature=0.1,
+            max_tokens=300,
+            streaming=True,
             api_key=os.getenv("OPENAI_API_KEY"),
+        )
+    elif provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            temperature=0.1,
+            max_tokens=300,
+            streaming=True,
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
         )
     else:
         raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
-llm = get_llm()
+
+def get_structural_llm():
+    """Non-streaming LLM for structured output (extraction, intent detection)"""
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    if provider == "groq":
+        return ChatGroq(
+            model=os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),
+            temperature=0.1,
+            max_tokens=300,
+            streaming=False,
+            api_key=os.getenv("GROQ_API_KEY"),
+        )
+    elif provider == "openai":
+        return ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.1,
+            max_tokens=300,
+            streaming=False,
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
+    elif provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            temperature=0.1,
+            max_tokens=300,
+            streaming=False,
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+        )
+    else:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+
+llm = get_streaming_llm()
+llm_struct = get_structural_llm()
 
 # ===========================================================
-# SERVICE NOW CREDENTIALS
+# SERVICE NOW CREDENTIALS (load from environment variables)
 # ===========================================================
-SERVICENOW_URL="https://dev286942.service-now.com"
-SERVICENOW_USERNAME="admin"
-SERVICENOW_PASSWORD="Rb5P3*e!lOFc"
+SERVICENOW_URL = os.getenv("SERVICENOW_URL", "https://dev286942.service-now.com")
+SERVICENOW_USERNAME = os.getenv("SERVICENOW_USERNAME", "")
+SERVICENOW_PASSWORD = os.getenv("SERVICENOW_PASSWORD", "")
 
 # ============================================================
 # STATE INIT
@@ -158,7 +202,7 @@ async def generate_short_description(text):
         ("system", "Summarize into one short sentence (max 10 words)."),
         ("human", "{text}")
     ])
-    chain = prompt | llm
+    chain = prompt | llm_struct
     res = await chain.ainvoke({"text": text})
     return res.content.strip()
 
@@ -222,8 +266,6 @@ class ServiceNowClient:
         self.auth = (self.username, self.password) if self.username and self.password else None
 
     async def create_ticket(self, ticket_data: Dict[str, Any]) -> str:
-        if not self.auth:
-            raise ValueError("ServiceNow credentials not configured")
 
         endpoint = f"{self.base_url}/api/now/table/incident"
 
@@ -293,7 +335,7 @@ async def infer_missing_fields(slots):
         ("human", "{text}")
     ])
 
-    chain = prompt | llm.with_structured_output(TicketSlots)
+    chain = prompt | llm_struct.with_structured_output(TicketSlots)
 
     try:
         res = await chain.ainvoke({"text": text})
@@ -364,7 +406,7 @@ extract_chain = ChatPromptTemplate.from_messages([
      "detailed_description: Cannot connect to VDI since morning, getting timeout error\n"
      ),
     ("human", "{text}")
-]) | llm.with_structured_output(TicketSlots)
+]) | llm_struct.with_structured_output(TicketSlots)
 
 
 question_chain = ChatPromptTemplate.from_messages([
@@ -382,7 +424,7 @@ question_chain = ChatPromptTemplate.from_messages([
      "- When did this issue start?\n"
      ),
     ("human", "Field: {field}")
-]) | llm.with_structured_output(QuestionOutput)
+]) | llm_struct.with_structured_output(QuestionOutput)
 
 
 intent_chain = ChatPromptTemplate.from_messages([
@@ -407,7 +449,7 @@ confirm_intent_chain = ChatPromptTemplate.from_messages([
      "not sure → unclear\n"
      ),
     ("human", "{text}")
-]) | llm.with_structured_output(ConfirmIntent)
+]) | llm_struct.with_structured_output(ConfirmIntent)
 
 # ============================================================
 # NODES
@@ -438,11 +480,11 @@ async def classify(state):
 
 
 async def greeting(state):
-    return {"messages": [AIMessage(content="Hi there! I can assist you in creating a ServiceNow ticket. Just let me know what issue you're facing, and I’ll take care of the rest.")]}
+    return {"messages": [AIMessage(content="Hi! I'll help create your ServiceNow ticket. What issue are you facing?")]}
 
 
 async def unrelated(state):
-    return {"messages": [AIMessage(content="Hi there! I can assist you in creating a ServiceNow ticket. Just let me know what issue you're facing, and I’ll take care of the rest.")]}
+    return {"messages": [AIMessage(content="Hi! I'll help create your ServiceNow ticket. What issue are you facing?")]}
 
 
 async def extract(state):
@@ -643,7 +685,7 @@ def build_agent():
         "confirm": "confirm"
     })
 
-    # 🔥 FIX: ask should continue flow
+    
     g.add_edge("ask", END)
 
     g.add_conditional_edges("handle_confirm", route_confirm, {
@@ -663,16 +705,94 @@ def build_agent():
 class CustomerSupportAgent:
     def __init__(self):
         self.app = build_agent()
+        self._conversation_history: List[BaseMessage] = []
+
+    async def stream(self, text: str, session_id: str) -> AsyncIterator[str]:
+        """
+        Stream ticket agent responses token-by-token for voice pipeline.
+        Maintains conversation history across turns.
+
+        Captures both:
+        - Streaming LLM tokens (from LLM processing in greeting/extract nodes)
+        - Static node responses (ask, confirm, handle_confirm, etc.) - ALWAYS SPOKEN
+
+        GUARANTEE: All stateful messages from ask/confirm/handle_confirm are yielded for TTS.
+        """
+        # Add user input to history
+        self._conversation_history.append(HumanMessage(content=text))
+
+        # Prepare state with history
+        state = {"messages": self._conversation_history.copy()}
+        full_response = ""
+        final_state = None
+        had_streaming = False
+
+        try:
+            async for event in self.app.astream_events(
+                state,
+                config={"configurable": {"thread_id": session_id}},
+                version="v2"
+            ):
+                # Capture streaming LLM tokens (greeting, extract nodes with streaming LLM)
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if hasattr(chunk, "content") and chunk.content:
+                        text_chunk = chunk.content
+                        full_response += text_chunk
+                        had_streaming = True
+                        logger.debug(f"Streaming token: {text_chunk[:50]}")
+                        yield text_chunk  # Stream to TTS pipeline
+
+                # Capture final graph state to get static node responses
+                elif event["event"] == "on_chain_end" and event.get("name") == "LangGraph":
+                    final_state = event.get("data", {}).get("output", {})
+                    logger.debug(f"Graph finished with state keys: {final_state.keys() if final_state else 'None'}")
+
+        except Exception as e:
+            logger.error(f"Ticket agent streaming error: {e}")
+            error_msg = "Sorry, I had trouble processing that. Could you repeat?"
+            yield error_msg
+            full_response = error_msg
+
+        # CRITICAL: Always extract and speak the last AIMessage from graph state
+        # This handles ask, confirm, handle_confirm, greeting, unrelated
+        # Even if there was streaming, we need the FINAL message (e.g., confirm summary after extraction)
+        if final_state:
+            messages = final_state.get("messages", [])
+            if messages and isinstance(messages[-1], AIMessage):
+                last_message = messages[-1].content
+                if last_message and last_message.strip():
+                    # Only yield if:
+                    # 1. No prior response, OR
+                    # 2. This is a different message (confirm/handle_confirm after ask)
+                    if not full_response or last_message != full_response:
+                        full_response = last_message
+                        logger.debug(f"Speaking static message from ask/confirm/handle_confirm: {last_message[:60]}")
+                        yield last_message
+                    elif not full_response:
+                        # First message and no streaming occurred
+                        full_response = last_message
+                        logger.debug(f"Speaking final message: {last_message[:60]}")
+                        yield last_message
+
+        # Append full assistant response to history
+        if full_response:
+            self._conversation_history.append(AIMessage(content=full_response))
+
+        # Keep history manageable (last 20 messages ~10 turns)
+        if len(self._conversation_history) > 20:
+            self._conversation_history = self._conversation_history[-20:]
+    
+    def reset(self):
+        """Clear conversation history for new session."""
+        self._conversation_history = []
 
     async def run_turn(self, text, session_id):
-        state = {"messages": [HumanMessage(content=text)]}
-
+        """Legacy synchronous method - use stream() for voice."""
+        state = {"messages": self._conversation_history + [HumanMessage(content=text)]}
         result = await self.app.ainvoke(
             state,
             config={"configurable": {"thread_id": session_id}}
         )
-
+        self._conversation_history.append(result["messages"][-1])
         return result["messages"][-1].content
-
-
-ticket_agent = CustomerSupportAgent().app
