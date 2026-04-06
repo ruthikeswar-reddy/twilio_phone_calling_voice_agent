@@ -45,7 +45,9 @@ class CartesiaTTS:
         Streams raw PCM audio bytes for the given text.
         Yields chunks as they arrive from Cartesia.
         """
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+        ) as client:
             headers = {
                 "Cartesia-Version": CARTESIA_VERSION,
                 "X-API-Key": CARTESIA_API_KEY,
