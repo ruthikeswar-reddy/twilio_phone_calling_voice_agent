@@ -1,85 +1,135 @@
 """
-VoicePipeline — Fixed with 5 targeted patches:
+VoicePipeline — Orchestrates the flow of audio and text between Twilio, STT, TTS, and the agent.  Key responsibilities:
+- Receiving audio from Twilio, sending it to STT, and handling the resulting transcripts.
+- Launching the agent with the appropriate transcript (interim speculative or final).
+- Streaming the agent's text response to TTS and sending the resulting audio back to Twilio.
+- Handling barge-in by cancelling the agent and clearing Twilio's buffer when the caller speaks during TTS playback.
 
-  FIX 1 — BARGE-IN ROOT CAUSE:
-    Removed per-media-packet barge-in check in _receive_twilio_loop.
-    Old code called _handle_barge_in() on EVERY incoming Twilio packet
-    while _is_speaking=True, including pure silence packets. Since Twilio
-    streams continuously, this fired barge-in within ~8ms of TTS starting.
-    New: barge-in is only triggered by Deepgram's VAD "speech_start" event,
-    meaning real speech energy detected on the line.
-
-  FIX 2 — BARGE-IN GRACE PERIOD:
-    Even with VAD-based barge-in, added a 500ms grace window after TTS
-    audio starts. The phone network/Twilio can echo back the agent's own
-    audio briefly. If VAD fires within 500ms of TTS start, it's suppressed.
-    Configurable via BARGE_IN_GRACE_MS.
-
-  FIX 3 — SPECULATIVE DEDUPLICATION:
-    Interim results fire on every STT word chunk. Without dedup, the same
-    phrase (e.g. "What can you do for me?") triggered 3 LLM calls in logs.
-    Fixed: track _last_speculative_text; skip if normalized text matches last.
-    Also track _last_speculative_reset_on_final to clear the guard on each
-    final transcript so the next utterance always works.
-
-  FIX 4 — SPECULATIVE vs FINAL CONFLICT RESOLUTION:
-    When speculative agent is mid-flight and final transcript arrives:
-      - similarity >= 0.80 → transcripts match, let speculative complete
-      - similarity <  0.80 → transcripts diverge, cancel & restart with final
-    This prevents two separate responses playing for one utterance.
-    Uses difflib.SequenceMatcher for lightweight text comparison.
-
-  FIX 5 — TRACK _is_speculative_active FLAG:
-    _launch_agent() now records whether it was launched speculatively.
-    Once the first LLM token arrives we clear the flag — at that point
-    we've committed to the response and won't let a divergent final cancel it.
 """
 
 import asyncio
 import base64
-import difflib
 import json
 import logging
 import re
 import time
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 from fastapi import WebSocket
 
 from stt.deepgram_stt import DeepgramSTT
 from tts.cartesia_tts import CartesiaTTS
-from agent.langgraph_agent import LangGraphAgent
+from agent.csa_groq import CustomerSupportAgent
 from audio_utils import ulaw_to_pcm, pcm_to_ulaw
 
 logger = logging.getLogger(__name__)
 
 # ── Tunable constants ────────────────────────────────────────────────────────
 
-MIN_TRANSCRIPT_WORDS = 3
-INTERIM_CONFIDENCE_THRESHOLD = 0.85
-
-# FIX 2: How long after TTS first-audio before barge-in is allowed (ms).
+# How long after TTS first-audio before barge-in is allowed (ms).
 # Prevents echo / network delay from instantly cancelling the agent.
-BARGE_IN_GRACE_MS = 500
-
-# FIX 4: Minimum similarity ratio (0-1) between speculative and final
-# transcript for the speculative response to be considered "correct enough"
-# and allowed to continue without restarting.
-SPECULATIVE_SIMILARITY_THRESHOLD = 0.80
+BARGE_IN_GRACE_MS = 700
 
 
-# ── Utility ──────────────────────────────────────────────────────────────────
+# Maps spoken digit words (including common STT variants) to digit characters.
+_DIGIT_WORDS: dict[str, str] = {
+    "zero": "0", "oh": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
 
-def _text_similarity(a: str, b: str) -> float:
+# Multi-word spoken phrases → their symbol/text equivalents.
+# Longer phrases must come before shorter overlapping ones.
+_SPOKEN_PHRASES: list[tuple[str, str]] = [
+    ("at the rate of", "@"),
+    ("at the rate",    "@"),
+    ("at rate",        "@"),
+    ("dot com",        ".com"),
+    ("dot net",        ".net"),
+    ("dot org",        ".org"),
+    ("dot in",         ".in"),
+    ("dot ai",         ".ai"),
+    ("dot io",         ".io"),
+    ("dot co",         ".co"),
+    ("underscore",     "_"),
+    ("hyphen",         "-"),
+    ("dash",           "-"),
+    ("dot",            "."),
+    ("at",             "@"),   # bare "at" as last resort for @ symbol
+]
+
+
+def _normalize_transcript(text: str) -> str:
     """
-    Normalised SequenceMatcher ratio between two strings (case-insensitive).
-    Returns 0.0 (totally different) … 1.0 (identical).
+    Normalise a raw STT transcript for the voice agent:
+
+    1. Replace spoken email symbols so the LLM receives a real email address:
+         "shruthi at the rate eminds dot ai"  → "shruthi@eminds.ai"
+         "john underscore doe at gmail dot com" → "john_doe@gmail.com"
+
+    2. Convert digit words to digits:
+         "one two three"  → "123"
+         "My ID is one two three" → "My ID is 123"
+
+    3. Collapse runs of single alphanumeric tokens into one token (for IDs):
+         "E M one two three" → "EM123"
     """
-    return difflib.SequenceMatcher(
-        None,
-        a.strip().lower(),
-        b.strip().lower(),
-    ).ratio()
+    lower = text.lower().strip()
+
+    # Step 1: replace multi-word spoken phrases with their symbols.
+    # Use regex word boundaries (\b) so that phrases like "at" don't match
+    # inside words like "batman" or "therateemail", preventing double-@ bugs.
+    for phrase, symbol in _SPOKEN_PHRASES:
+        lower = re.sub(r"\b" + re.escape(phrase) + r"\b", symbol, lower)
+
+    # After phrase substitution, collapse any spaces that crept in around
+    # symbols that are part of an email address (e.g. "shruthi @ eminds . ai")
+    # by removing spaces adjacent to @ . _ -
+    lower = re.sub(r"\s*@\s*", "@", lower)
+    lower = re.sub(r"\s*\.\s*", ".", lower)
+    lower = re.sub(r"\s*_\s*", "_", lower)
+    lower = re.sub(r"\s*-\s*", "-", lower)
+
+    tokens = lower.split()
+
+    # Step 2: digit-word → digit character
+    converted = []
+    for tok in tokens:
+        stripped = tok.rstrip(".,!?;:")
+        punct = tok[len(stripped):]
+        converted.append(_DIGIT_WORDS.get(stripped, stripped) + punct)
+
+    # Step 3: merge runs of single alphanumeric tokens (e.g. spelled-out IDs).
+    # Tokens may carry trailing punctuation (e.g. "3." from "three.") — strip it
+    # before the single-char check and re-attach it only to the last token in the run.
+    merged: list[str] = []
+    i = 0
+    while i < len(converted):
+        tok = converted[i]
+        core = tok.rstrip(".,!?;:")
+        trail = tok[len(core):]
+        if len(core) == 1 and core.isalnum():
+            run = [core]
+            run_trail = trail
+            j = i + 1
+            while j < len(converted):
+                nt = converted[j]
+                nt_core = nt.rstrip(".,!?;:")
+                nt_trail = nt[len(nt_core):]
+                if len(nt_core) == 1 and nt_core.isalnum():
+                    run.append(nt_core)
+                    run_trail = nt_trail
+                    j += 1
+                else:
+                    break
+            if len(run) > 1:
+                merged.append("".join(run) + run_trail)
+                i = j
+                continue
+        merged.append(tok)
+        i += 1
+
+    return " ".join(merged)
 
 
 # ── Main class ───────────────────────────────────────────────────────────────
@@ -92,7 +142,7 @@ class VoicePipeline:
 
         self.stt = DeepgramSTT()
         self.tts = CartesiaTTS()
-        self.agent = LangGraphAgent()
+        self.agent = CustomerSupportAgent()
 
         self._agent_task: Optional[asyncio.Task] = None
         self._is_speaking = False
@@ -106,21 +156,18 @@ class VoicePipeline:
         self._tts_text_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self._audio_output_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
 
-        # FIX 3: speculative dedup state
-        # Stores the normalised (lower-stripped) text of the last speculative
-        # launch so we can skip identical interim events.
-        self._last_speculative_text: str = ""
-
-        # FIX 4 & 5: speculative conflict-resolution state
-        self._current_agent_text: str = ""       # transcript the running agent was given
-        self._is_speculative_active: bool = False # True only until first LLM token arrives
-
         # Token-by-token TTS buffering for low-latency streaming
         self._tts_token_buffer = ""
         self._tts_buffer_timer: Optional[asyncio.TimerHandle] = None
         self._tts_min_buffer_chars = 100
         self._tts_buffer_timeout = 0.05
         self._tts_buffer_start_time: float = 0
+
+        # Barge-in is a two-step process:
+        #   1. speech_start → arm (if grace period passed)
+        #   2. interim/final transcript → fire (confirms real speech, not noise/echo)
+        # This prevents background noise / TTS echo from triggering barge-in.
+        self._barge_in_armed: bool = False
 
     # ── Top-level runner ─────────────────────────────────────────────────────
 
@@ -178,7 +225,12 @@ class VoicePipeline:
         try:
             async for event in stt_stream.events():
 
-                # ── FIX 1 + FIX 2: VAD-based barge-in with grace period ───
+                # ── VAD-based barge-in: two-step arm → fire ──────────────
+                # Step 1 (arm): speech_start fires immediately on any sound.
+                #   We only ARM here after the grace period — we do NOT fire yet,
+                #   because background noise / TTS echo also triggers speech_start.
+                # Step 2 (fire): when an interim/final transcript arrives while
+                #   armed, we know real speech content was detected and fire.
                 if event["type"] == "speech_start":
                     self._turn_start_time = time.monotonic()
 
@@ -188,100 +240,60 @@ class VoicePipeline:
                         ) * 1000
 
                         if elapsed_tts_ms >= BARGE_IN_GRACE_MS:
-                            # Real speech detected after grace period — valid barge-in
-                            logger.info(
-                                f"BARGE-IN detected (VAD speech_start, "
-                                f"TTS had been playing {elapsed_tts_ms:.0f}ms)"
+                            self._barge_in_armed = True
+                            logger.debug(
+                                f"Barge-in ARMED (VAD speech_start, "
+                                f"TTS playing {elapsed_tts_ms:.0f}ms) — "
+                                f"waiting for transcript to confirm"
                             )
-                            await self._handle_barge_in()
                         else:
-                            # Too soon after TTS started — likely echo / network artefact
                             logger.debug(
                                 f"Barge-in suppressed — grace period active "
                                 f"(TTS only {elapsed_tts_ms:.0f}ms old, "
                                 f"threshold={BARGE_IN_GRACE_MS}ms)"
                             )
 
-                # ── FIX 3: Speculative dedup ──────────────────────────────
                 elif event["type"] == "interim":
-                    transcript = event["transcript"]
-                    confidence = event.get("confidence", 0)
-                    words = len(transcript.split())
-                    logger.debug(f"Interim [{confidence:.2f}]: {transcript}")
+                    transcript = event.get("transcript", "").strip()
+                    logger.debug(
+                        f"Interim [{event.get('confidence', 0):.2f}]: {transcript}"
+                    )
+                    # Fire armed barge-in only when real speech content is confirmed
+                    if self._barge_in_armed and self._is_speaking and transcript:
+                        elapsed_tts_ms = (
+                            time.monotonic() - self._tts_audio_start_time
+                        ) * 1000
+                        logger.info(
+                            f"BARGE-IN detected (interim transcript confirmed, "
+                            f"TTS had been playing {elapsed_tts_ms:.0f}ms)"
+                        )
+                        self._barge_in_armed = False
+                        await self._handle_barge_in()
 
-                    normalised = transcript.strip().lower()
-                    is_duplicate = (normalised == self._last_speculative_text)
-
-                    if (
-                        words >= MIN_TRANSCRIPT_WORDS
-                        and confidence >= INTERIM_CONFIDENCE_THRESHOLD
-                        and not self._is_speaking
-                        and (self._agent_task is None or self._agent_task.done())
-                        and not is_duplicate   # FIX 3: skip identical re-trigger
-                    ):
-                        logger.info(f"Speculative start on interim: '{transcript}'")
-                        self._last_speculative_text = normalised
-                        self._turn_start_time = time.monotonic()
-                        self._launch_agent(transcript, speculative=True)
-
-                # ── FIX 4: Speculative vs Final conflict resolution ────────
                 elif event["type"] == "final":
                     transcript = event["transcript"].strip()
                     if not transcript:
+                        self._barge_in_armed = False
                         continue
+
+                    # Fire any pending armed barge-in before handling agent launch
+                    if self._barge_in_armed and self._is_speaking:
+                        elapsed_tts_ms = (
+                            time.monotonic() - self._tts_audio_start_time
+                        ) * 1000
+                        logger.info(
+                            f"BARGE-IN detected (final transcript confirmed, "
+                            f"TTS had been playing {elapsed_tts_ms:.0f}ms)"
+                        )
+                        await self._handle_barge_in()
+                    self._barge_in_armed = False
 
                     logger.info(f"Final transcript: '{transcript}'")
                     elapsed = (time.monotonic() - self._turn_start_time) * 1000
                     logger.info(f"STT->final latency: {elapsed:.0f}ms")
 
-                    # Reset dedup guard so the NEXT utterance starts fresh
-                    self._last_speculative_text = ""
-
-                    agent_running = (
-                        self._agent_task and not self._agent_task.done()
-                    )
-
-                    if agent_running and self._is_speculative_active:
-                        # A speculative agent is mid-flight. Check if the final
-                        # transcript is close enough to let it continue.
-                        similarity = _text_similarity(
-                            self._current_agent_text, transcript
-                        )
-                        logger.info(
-                            f"Speculative similarity check: {similarity:.2f} "
-                            f"('{self._current_agent_text}' vs '{transcript}')"
-                        )
-
-                        if similarity >= SPECULATIVE_SIMILARITY_THRESHOLD:
-                            # Close enough — speculative was right, no restart
-                            logger.info(
-                                f"Speculative matched final "
-                                f"(similarity={similarity:.2f}) — continuing"
-                            )
-                            # Mark as no longer speculative so it won't be
-                            # cancelled by a second final (edge case)
-                            self._is_speculative_active = False
-                        else:
-                            # Transcript diverged significantly — cancel and
-                            # relaunch with the correct final text
-                            logger.info(
-                                f"Speculative diverged from final "
-                                f"(similarity={similarity:.2f}) — restarting"
-                            )
-                            self._turn_start_time = time.monotonic()
-                            self._launch_agent(transcript, speculative=False)
-
-                    elif agent_running and not self._is_speculative_active:
-                        # A non-speculative (final) agent is already running —
-                        # this final is a duplicate, ignore it.
-                        logger.debug(
-                            "Final agent already running — duplicate final ignored"
-                        )
-
-                    else:
-                        # No agent running at all — start fresh with final
-                        self._turn_start_time = time.monotonic()
-                        self._launch_agent(transcript, speculative=False)
+                    self._turn_start_time = time.monotonic()
+                    self._launch_agent(transcript)
 
         except asyncio.CancelledError:
             pass
@@ -290,37 +302,33 @@ class VoicePipeline:
 
     # ── Agent launcher & runner ──────────────────────────────────────────────
 
-    def _launch_agent(self, transcript: str, speculative: bool = False):
+    def _launch_agent(self, transcript: str):
+        transcript = _normalize_transcript(transcript)
+
         if self._agent_task and not self._agent_task.done():
             self._agent_task.cancel()
         self._drain_queue(self._tts_text_queue)
         self._drain_queue(self._audio_output_queue)
 
-        # FIX 4 & 5: record what text this agent is working on and whether
-        # it is speculative, so the final-transcript handler can compare.
-        self._current_agent_text = transcript
-        self._is_speculative_active = speculative
+        self._agent_task = asyncio.create_task(self._run_agent(transcript))
 
-        self._agent_task = asyncio.create_task(
-            self._run_agent(transcript, speculative)
-        )
-
-    async def _run_agent(self, transcript: str, speculative: bool):
+    async def _run_agent(self, transcript: str):
         try:
-            logger.info(
-                f"Agent starting ({'speculative' if speculative else 'final'})"
-            )
+            logger.info("Agent starting")
             agent_start = time.monotonic()
             first_token = True
 
-            async for text_chunk in self.agent.stream(transcript):
+            async for text_chunk in self.agent.stream(
+                transcript,
+                self.call_sid or "default",
+                speculative=False,
+            ):
                 if first_token:
                     logger.info(
                         f"First LLM token: "
                         f"{(time.monotonic()-agent_start)*1000:.0f}ms"
                     )
                     first_token = False
-                    self._is_speculative_active = False
                 await self._tts_text_queue.put(text_chunk)
 
             await self._tts_text_queue.put(None)
@@ -397,19 +405,22 @@ class VoicePipeline:
                                 logger.debug(
                                     f"Buffer flush ({flush_reason}, "
                                     f"{len(buffer_to_send)} chars, {elapsed:.0f}ms): "
-                                    f"'{buffer_to_send[:60]}'"
+                                    f"'{buffer_to_send}'"
                                 )
 
                                 if not tts_started:
                                     logger.info(
-                                        f"TTS starting: '{buffer_to_send[:60]}'"
+                                        f"TTS starting: '{buffer_to_send[:80]}...'"
+                                        if len(buffer_to_send) > 80
+                                        else f"TTS starting: '{buffer_to_send}'"
                                     )
                                     tts_started = True
 
-                                async for audio_chunk in self.tts.synthesize_stream(
-                                    buffer_to_send
-                                ):
-                                    await self._audio_output_queue.put(audio_chunk)
+                                for segment in self._split_for_tts(buffer_to_send):
+                                    async for audio_chunk in self.tts.synthesize_stream(
+                                        segment
+                                    ):
+                                        await self._audio_output_queue.put(audio_chunk)
 
                             self._tts_token_buffer = ""
                             self._tts_buffer_start_time = time.monotonic()
@@ -436,6 +447,7 @@ class VoicePipeline:
 
             if chunk is None:
                 self._is_speaking = False
+                self._barge_in_armed = False  # disarm when TTS finishes
                 first_audio = True
                 continue
 
@@ -475,7 +487,7 @@ class VoicePipeline:
             {"event": "clear", "streamSid": self.stream_sid}
         )
         self._is_speaking = False
-        self._is_speculative_active = False
+        self._barge_in_armed = False
         self._drain_queue(self._tts_text_queue)
         self._drain_queue(self._audio_output_queue)
 
@@ -487,6 +499,27 @@ class VoicePipeline:
         if len(parts) <= 1:
             return [], text
         return parts[:-1], parts[-1]
+
+    @staticmethod
+    def _split_for_tts(text: str) -> list[str]:
+        """
+        Split long text into speakable segments for individual TTS calls.
+        Splits on newlines first, then sentence boundaries within long lines.
+        Filters out empty segments and structural labels that read awkwardly.
+        """
+        segments: list[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # If line is short enough, send as-is
+            if len(line) <= 120:
+                segments.append(line)
+            else:
+                # Split long lines on sentence boundaries
+                parts = re.split(r"(?<=[.!?])\s+", line)
+                segments.extend(p.strip() for p in parts if p.strip())
+        return segments or [text.strip()]
 
     @staticmethod
     def _drain_queue(q: asyncio.Queue):
