@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from voice_pipeline import VoicePipeline
+from voice_pipeline import VoicePipeline  # Use the new Flux-based pipeline implementation
 
 load_dotenv()
 logging.basicConfig(
@@ -49,7 +49,7 @@ _active_calls: dict[str, VoicePipeline] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Voice Agent starting up")
-    logger.info(f"   LLM: {os.getenv('LLM_PROVIDER', 'openai')} / {os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}")
+    logger.info(f"   LLM: {os.getenv('LLM_PROVIDER', 'openai')} / {os.getenv('GROQ_MODEL', 'gpt-4o-mini')}")
     logger.info(f"   Port: {os.getenv('PORT', 8000)}")
     yield
     logger.info(f"Voice Agent shutting down — {len(_active_calls)} calls were active")
@@ -138,7 +138,10 @@ async def media_stream(websocket: WebSocket):
     except asyncio.TimeoutError:
         logger.warning(f"⏰ Call {call_sid} timed out")
     except Exception as e:
-        logger.exception(f"💥 Pipeline error on call {call_sid}: {e}")
+        # TaskGroup wraps task exceptions in ExceptionGroup — unwrap for readable logs
+        errors = e.exceptions if isinstance(e, ExceptionGroup) else [e]
+        for err in errors:
+            logger.error(f"💥 Pipeline error on call {call_sid}: {type(err).__name__}: {err}")
     finally:
         _active_calls.pop(call_sid, None)
         await pipeline.cleanup()
