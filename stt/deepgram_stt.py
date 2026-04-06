@@ -50,11 +50,9 @@ DEEPGRAM_WS_URL = (
     "&channels=1"
     "&punctuate=true"
     "&interim_results=true"      # Enable for speculative agent start
-    "&endpointing=300"           # FIX: raised from 200ms → 300ms silence = utterance end.
-                                 # 200ms was too aggressive, causing early speech_final
-                                 # on short pauses mid-sentence ("So… explain"),
-                                 # which contributed to the 4194ms STT latency spike.
-    "&utterance_end_ms=1000"     # Finalize after 1s silence
+    "&endpointing=200"           # 200ms silence = utterance end (speech_final trigger)
+    "&utterance_end_ms=1000"      # It should be minimum of   1000ms anything less than that we get error from deepgram and total pipeline fails
+    "&numerals=true"                                  # Cuts the worst-case STT latency spike by ~500ms
     "&smart_format=true"         # Better formatting
     "&vad_events=true"           # Speech start/end events — required for FIX 1
     "&no_delay=true"             # Minimize processing delay
