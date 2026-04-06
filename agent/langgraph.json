@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs":{
+        "ticket-agent": "./csa_groq.py:graph"
+    },
+    ".env": "../.env"
+}
