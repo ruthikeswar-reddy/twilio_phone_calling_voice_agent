@@ -48,7 +48,7 @@ _active_calls: dict[str, VoicePipeline] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Voice Agent starting up")
+    logger.info("Voice Agent starting up")
     logger.info(f"   LLM: {os.getenv('LLM_PROVIDER', 'openai')} / {os.getenv('GROQ_MODEL', 'gpt-4o-mini')}")
     logger.info(f"   Port: {os.getenv('PORT', 8000)}")
     yield
@@ -92,7 +92,7 @@ async def incoming_call(request: Request):
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         "<Response>\n"
-        '  <Say voice="alice">Please wait while I connect you to our AI assistant.</Say>\n'
+        '  <Say voice="alice">Hi I am your IT Support Assistant. How can I help you today</Say>\n'
         "  <Connect>\n"
         f'    <Stream url="{ws_url}">\n'
         '      <Parameter name="caller" value="{From}"/>\n'
@@ -101,7 +101,7 @@ async def incoming_call(request: Request):
         "</Response>"
     )
 
-    logger.info(f"📞 Incoming call — directing Media Stream to {ws_url}")
+    logger.info(f"Incoming call — directing Media Stream to {ws_url}")
     return Response(content=twiml, media_type="text/xml")
 
 
@@ -131,17 +131,17 @@ async def media_stream(websocket: WebSocket):
     pipeline = VoicePipeline(websocket)
 
     try:
-        logger.info("📡 New Twilio Media Stream WebSocket connection")
+        logger.info(" New Twilio Media Stream WebSocket connection")
         call_sid = await pipeline.run()
     except WebSocketDisconnect:
-        logger.info(f"📵 Call {call_sid} disconnected")
+        logger.info(f"Call {call_sid} disconnected")
     except asyncio.TimeoutError:
-        logger.warning(f"⏰ Call {call_sid} timed out")
+        logger.warning(f"Call {call_sid} timed out")
     except Exception as e:
         # TaskGroup wraps task exceptions in ExceptionGroup — unwrap for readable logs
         errors = e.exceptions if isinstance(e, ExceptionGroup) else [e]
         for err in errors:
-            logger.error(f"💥 Pipeline error on call {call_sid}: {type(err).__name__}: {err}")
+            logger.error(f"Pipeline error on call {call_sid}: {type(err).__name__}: {err}")
     finally:
         _active_calls.pop(call_sid, None)
         await pipeline.cleanup()

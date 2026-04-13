@@ -22,7 +22,7 @@ CARTESIA_API_URL = "https://api.cartesia.ai/tts/bytes"
 
 # Cartesia WebSocket streaming endpoint for lowest latency
 CARTESIA_WS_URL = "wss://api.cartesia.ai/tts/websocket"
-CARTESIA_VERSION = "2024-06-10"
+CARTESIA_VERSION = "2025-04-16"
 
 
 class CartesiaTTS:
@@ -39,6 +39,11 @@ class CartesiaTTS:
             "encoding": "pcm_s16le",
             "sample_rate": 8000,  # Match Twilio 8kHz
         }
+        self.generation_config = {
+            "speed": 1,
+            "volume": 1.2000000000000002,
+            "emotion": "content"
+        }
 
     async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
         """
@@ -54,13 +59,14 @@ class CartesiaTTS:
                 "Content-Type": "application/json",
             }
             payload = {
-                "model_id": "sonic-english",   # Fastest model
+                "model_id": "sonic-3",   # Fastest model
                 "transcript": text,
                 "voice": {
                     "mode": "id",
                     "id": self.voice_id,
                 },
                 "output_format": self.output_format,
+                "generation_config": self.generation_config,
                 "language": "en",
             }
 

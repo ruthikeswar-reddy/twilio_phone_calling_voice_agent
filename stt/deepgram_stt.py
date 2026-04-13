@@ -79,8 +79,8 @@ class DeepgramSTTStream:
         self._ws = await websockets.connect(
             DEEPGRAM_WS_URL,
             additional_headers=headers,
-            ping_interval=10,
-            ping_timeout=5,
+            ping_interval=20,
+            ping_timeout=15,
             max_size=2**20,
         )
         self._receiver_task = asyncio.create_task(self._receive_loop())

@@ -13,7 +13,8 @@ import httpx
 import asyncio
 import logging
 logger = logging.getLogger(__name__)
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # ============================================================
 # LLM
@@ -91,11 +92,12 @@ def ensure_state(state):
 # ============================================================
 
 REQUIRED_FIELDS = [
+    "employee_id",
     "detailed_description",
     "short_description",
-    "employee_id",
-    "employee_email",
-    "location",
+    "first_observed",
+    "troubleshooting_steps_tried",
+    "priority",
 ]
 
 
@@ -107,13 +109,14 @@ class ClassifyIntent(BaseModel):
 
 class TicketSlots(BaseModel):
     employee_id: Optional[str] = None
-    employee_email: Optional[str] = None
-    location: Optional[str] = None
     short_description: Optional[str] = None
     detailed_description: Optional[str] = None
     category: Optional[str] = None
+    subcategory: Optional[str] = None
     priority: Optional[str] = None
-    
+    first_observed: Optional[str] = None
+    troubleshooting_steps_tried: Optional[str] = None
+
 
 
 class QuestionOutput(BaseModel):
@@ -144,8 +147,12 @@ def is_valid_email(email):
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
 
 
-def is_valid_employee_id(eid):
-    return bool(re.match(r"^[A-Z0-9]{3,15}$", eid.upper()))
+def is_valid_employee_id(eid: str) -> bool:
+    # Fix 4: strip hyphens and spaces before validation — users say "E-123" or "EM 123".
+    # Also relax minimum length from 3 to 2 (IDs like "E1" are valid in some orgs)
+    # and maximum from 15 to 20 to accommodate longer formats.
+    normalized = re.sub(r"[\s\-]", "", eid.upper())
+    return bool(re.match(r"^[A-Z0-9]{2,20}$", normalized))
 
 
 def is_weak(text):
@@ -166,16 +173,21 @@ def merge_slots(old, new):
     return merged
 
 
-def enforce_description_rules(slots, original_text):
+def enforce_description_rules(slots, original_text, pending_field=None):
     text = original_text.strip().lower()
 
-    is_short = len(text.split()) <= 7 and "," not in text
+    # Fix 7: Only apply the short-input guard when we are NOT actively collecting
+    # detailed_description. If pending_field == "detailed_description" the agent
+    # explicitly asked for it — accept whatever the user says, even if brief.
+    # Also tightened threshold from 7 to 4 words: "VPN is not connecting" (4 words)
+    # is a valid description and was being incorrectly cleared before.
+    if pending_field != "detailed_description":
+        is_short = len(text.split()) <= 4 and "," not in text
+        if is_short and not slots.get("detailed_description"):
+            slots["detailed_description"] = None
 
-    # If short input → NEVER allow detailed_description
-    if is_short and not slots.get("detailed_description"):
-        slots["detailed_description"] = None
-
-    # Prevent duplication
+    # Prevent duplication: if short_description and detailed_description are identical,
+    # clear detailed_description so the LLM is asked for a fuller explanation.
     if slots.get("short_description") and slots.get("detailed_description"):
         if slots["short_description"].strip().lower() == slots["detailed_description"].strip().lower():
             slots["detailed_description"] = None
@@ -185,7 +197,7 @@ def enforce_description_rules(slots, original_text):
 
 async def generate_short_description(text):
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Summarize into one short sentence (max 10 words)."),
+        ("system", "Summarize into one short sentence not missing the user provided context (max 10 words)."),
         ("human", "{text}")
     ])
     chain = prompt | llm_struct
@@ -194,47 +206,53 @@ async def generate_short_description(text):
 
 
 def get_pending(slots):
+    # Validate existing employee_id if present but invalid
+    if slots.get("employee_id") and not is_valid_employee_id(slots["employee_id"]):
+        return "employee_id"
+
+    if not slots.get("employee_id"):
+        return "employee_id"
+
     if not slots.get("detailed_description"):
         return "detailed_description"
 
     if not slots.get("short_description"):
         return "short_description"
 
-    if slots.get("employee_email") and not is_valid_email(slots["employee_email"]):
-        return "employee_email"
+    if not slots.get("first_observed"):
+        return "first_observed"
 
-    if slots.get("employee_id") and not is_valid_employee_id(slots["employee_id"]):
-        return "employee_id"
+    if not slots.get("troubleshooting_steps_tried"):
+        return "troubleshooting_steps_tried"
 
-    for f in ["employee_id", "employee_email", "location"]:
-        if not slots.get(f):
-            return f
+    if not slots.get("priority"):
+        return "priority"
 
     return None
 
 
 def summarize(slots):
     return (
-        f"Here's the summary of your ticket:\n"
+        f"Summary of the information received for creating the ticket:\n"
         f"Employee ID: {slots.get('employee_id','')}\n"
-        f"Email: {slots.get('employee_email','')}\n"
-        f"Location: {slots.get('location','')}\n\n"
-        f"Short Description of Issue: {slots.get('short_description','')}\n"
-        f"Detailed Description of Issue: {slots.get('detailed_description','')}\n\n"
-        f"Category: {slots.get('category','')}\n"
+        f"Short Description: {slots.get('short_description','')}\n"
+        f"Observed Error: {slots.get('detailed_description','')}\n"
+        f"First Observed: {slots.get('first_observed','')}\n"
+        f"Troubleshooting Steps Tried: {slots.get('troubleshooting_steps_tried','')}\n"
         f"Priority: {slots.get('priority','')}\n\n"
-        "Is everything correct or would you like to change anything?"
+        "Would you like me to add any other information or change any existing information?"
     )
 
 
 def fallback_question(field):
     return {
-        "detailed_description": "Could you explain the issue in detail?",
-        "short_description": "Could you give a short summary?",
-        "employee_id": "May I have your employee ID?",
-        "employee_email": "Could you share your company email?",
-        "location": "Which location are you working from?"
-    }.get(field, "Could you provide more details?")
+        "employee_id": "Sure, I can help with that. Could you please share your Employee ID?",
+        "detailed_description": "Thanks. Could you briefly describe the issue or error you're seeing?",
+        "short_description": "Got it. Could you give a short summary of the issue?",
+        "first_observed": "Understood. When did you first notice this issue?",
+        "troubleshooting_steps_tried": "Have you tried any basic troubleshooting steps like restarting or reconnecting?",
+        "priority": "Got it. Please confirm the priority — Low, Medium, or High?",
+    }.get(field, "Got it. Could you provide more details?")
 
 
 PRIORITY_MAP = {
@@ -261,14 +279,22 @@ class ServiceNowClient:
             "3"
         )
 
+        troubleshooting = ticket_data.get("troubleshooting_steps_tried", "")
+        first_observed = ticket_data.get("first_observed", "")
+        detailed = ticket_data.get("detailed_description", "")
+        full_description = detailed
+        if first_observed:
+            full_description += f"\n\nFirst Observed: {first_observed}"
+        if troubleshooting:
+            full_description += f"\n\nTroubleshooting Steps Tried: {troubleshooting}"
+
         payload = {
             "short_description": ticket_data.get("short_description"),
-            "description": ticket_data.get("detailed_description"),
+            "description": full_description,
             "priority": priority,
-            "caller_id": ticket_data.get("employee_email"),  # safer default
-            "location": ticket_data.get("location"),
             "category": ticket_data.get("category"),
-            "u_employee_id": ticket_data.get("employee_id"),  # optional custom field
+            "subcategory": ticket_data.get("subcategory"),
+            "u_employee_id": ticket_data.get("employee_id"),
         }
         logger.info(f"Creating ServiceNow ticket with payload: {payload}")
         for attempt in range(3):
@@ -312,44 +338,84 @@ class ServiceNowClient:
 snow_client = ServiceNowClient()
 
 # ============================================================
-# NEW: CATEGORY + PRIORITY INFERENCE
+# CATEGORY + SUBCATEGORY INFERENCE
 # ============================================================
 
+# Valid ServiceNow category → subcategory mapping
+CATEGORY_SUBCATEGORY_MAP = {
+    "Network":         ["DHCP", "DNS", "IP Address", "VPN", "Wireless"],
+    "Software":        ["Email", "Operating System"],
+    "Hardware":        ["CPU", "Disk", "Monitor", "Keyboard", "Memory", "Mouse"],
+    "Inquiry/Help":    ["Antivirus", "Email", "Internal Application"],
+    "Database":        ["DB2", "MSSQL Server", "Oracle"],
+    "Password Reset":  [],
+}
+
+_INFER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an IT support classifier. Given the issue description, infer the best category and subcategory.\n"
+     "\n"
+     "Available categories and their subcategories:\n"
+     "- Network: DHCP, DNS, IP Address, VPN, Wireless\n"
+     "- Software: Email, Operating System\n"
+     "- Hardware: CPU, Disk, Monitor, Keyboard, Memory, Mouse\n"
+     "- Inquiry/Help: Antivirus, Email, Internal Application\n"
+     "- Database: DB2, MSSQL Server, Oracle\n"
+     "- Password Reset: (no subcategory)\n"
+     "\n"
+     "Rules:\n"
+     "- Choose ONLY from the categories and subcategories listed above.\n"
+     "- If no subcategory fits, set subcategory to null.\n"
+     "- For Password Reset issues, always set subcategory to null.\n"
+     "\n"
+     "Return ONLY a JSON object:\n"
+     "{{\"category\": \"Network\", \"subcategory\": \"VPN\"}}\n"
+     "\n"
+     "Examples:\n"
+     "Issue: unable to connect to VPN, authentication failed → {{\"category\": \"Network\", \"subcategory\": \"VPN\"}}\n"
+     "Issue: cannot send or receive emails → {{\"category\": \"Software\", \"subcategory\": \"Email\"}}\n"
+     "Issue: laptop keyboard not responding → {{\"category\": \"Hardware\", \"subcategory\": \"Keyboard\"}}\n"
+     "Issue: forgot my Windows password → {{\"category\": \"Password Reset\", \"subcategory\": null}}\n"
+     "Issue: Oracle database connection failing → {{\"category\": \"Database\", \"subcategory\": \"Oracle\"}}\n"
+     "Issue: antivirus not updating → {{\"category\": \"Inquiry/Help\", \"subcategory\": \"Antivirus\"}}\n"
+     ),
+    ("human", "{text}")
+])
+
+
 async def infer_missing_fields(slots):
-    if slots.get("category") and slots.get("priority"):
+    """Infer category and subcategory from the issue description. Never asks the user."""
+    if slots.get("category") and slots.get("subcategory") is not None:
         return slots
 
     text = slots.get("detailed_description") or slots.get("short_description") or ""
-
     if not text:
         return slots
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "Infer the single best category and priority for this IT support issue.\n"
-         "Category options: VDI, Network, Access, Hardware, Software\n"
-         "Priority options: Low, Medium, High, Critical\n"
-         "\n"
-         "Return ONLY a JSON object with no explanation:\n"
-         "{{\"category\": \"VDI\", \"priority\": \"Medium\"}}\n"),
-        ("human", "{text}")
-    ])
-
-    async def call_llm(prompt_text):
-        chain = prompt | llm_struct
-        res = await chain.ainvoke({"text": prompt_text})
-        return parse_structured_json(res.content, TicketSlots)
-
     try:
-        res = await call_llm(text)
+        chain = _INFER_PROMPT | llm_struct
+        res = await chain.ainvoke({"text": text})
+        parsed = parse_structured_json(res.content, TicketSlots)
 
-        if not slots.get("category") and res.category:
-            slots["category"] = res.category
+        if not slots.get("category") and parsed.category:
+            # Validate category is in our allowed list
+            if parsed.category in CATEGORY_SUBCATEGORY_MAP:
+                slots["category"] = parsed.category
+                logger.info(f"[INFER] category='{parsed.category}'")
 
-        if not slots.get("priority") and res.priority:
-            slots["priority"] = res.priority
-    except:
-        pass
+        if parsed.subcategory:
+            cat = slots.get("category", "")
+            allowed_subs = CATEGORY_SUBCATEGORY_MAP.get(cat, [])
+            if parsed.subcategory in allowed_subs:
+                slots["subcategory"] = parsed.subcategory
+                logger.info(f"[INFER] subcategory='{parsed.subcategory}'")
+            else:
+                slots["subcategory"] = None
+        else:
+            slots.setdefault("subcategory", None)
+
+    except Exception as e:
+        logger.warning(f"[INFER] category/subcategory inference failed: {e}")
 
     return slots
 
@@ -359,16 +425,20 @@ async def infer_missing_fields(slots):
 # ============================================================
 
 def detect_field_to_update(text):
+    # Fix 5: Expanded keyword coverage to handle natural language references.
+    # Original list was too narrow — "the date", "the ID", "it was wrong" all failed.
     text = text.lower()
 
-    if "employee id" in text:
+    if any(k in text for k in ["employee id", "emp id", "staff id", "my id", "the id", "id is", "id number"]):
         return "employee_id"
-    if "email" in text:
-        return "employee_email"
-    if "location" in text:
-        return "location"
-    if "description" in text:
+    if any(k in text for k in ["description", "issue", "error", "problem", "what i said", "the error"]):
         return "detailed_description"
+    if any(k in text for k in ["priority", "urgent", "urgency", "critical", "severity"]):
+        return "priority"
+    if any(k in text for k in ["observed", "when", "date", "time", "started", "noticed", "first seen", "first time"]):
+        return "first_observed"
+    if any(k in text for k in ["troubleshoot", "steps", "tried", "attempt", "restart", "relog"]):
+        return "troubleshooting_steps_tried"
 
     return None
 
@@ -381,42 +451,45 @@ extract_chain = ChatPromptTemplate.from_messages([
      "You extract structured ticket fields from user input. Extract ONLY what is explicitly present.\n"
      "\n"
      "Fields:\n"
-     "- employee_id: alphanumeric employee identifier (e.g. EM123, 123, E001)\n"
-     "- employee_email: work email address\n"
-     "- location: office or city name\n"
+     "- employee_id: alphanumeric employee identifier (e.g. EM123, EMP10234, 123, E001)\n"
      "- short_description: brief issue title (5-10 words)\n"
-     "- detailed_description: full problem explanation (requires context, min ~20 words)\n"
+     "- detailed_description: the error or problem the user is experiencing\n"
      "- category: VDI, Network, Access, Hardware, or Software\n"
      "- priority: Low, Medium, High, or Critical\n"
+     "- first_observed: when the user first noticed the issue (e.g. 'this morning', 'yesterday', 'last week')\n"
+     "- troubleshooting_steps_tried: steps the user has already attempted (e.g. 'restarted, reconnected')\n"
      "\n"
      "RULES:\n"
-     "- If input is ONLY an ID, number, email, or location → extract ONLY that field, set all others null\n"
+     "- If input is ONLY an ID or number → extract ONLY employee_id, set all others null\n"
      "- If input is a brief problem statement → extract ONLY short_description\n"
      "- If input is a detailed problem explanation → extract detailed_description AND short_description\n"
+     "- If input describes when issue started → extract ONLY first_observed\n"
+     "- If input describes steps already tried → extract ONLY troubleshooting_steps_tried\n"
+     "- If input is a priority level (low/medium/high/critical) → extract ONLY priority\n"
      "- NEVER copy short_description into detailed_description\n"
      "- NEVER invent or expand values beyond what the user said\n"
      "\n"
      "Return ONLY a JSON object with these keys (null if not present):\n"
-     "employee_id, employee_email, location, short_description, detailed_description, category, priority\n"
+     "employee_id, short_description, detailed_description, category, priority, first_observed, troubleshooting_steps_tried\n"
      "\n"
      "Examples:\n"
-     "Input: My employee ID is EM123\n"
-     "{{\"employee_id\": \"EM123\", \"short_description\": null, \"detailed_description\": null}}\n"
+     "Input: My employee ID is EMP10234\n"
+     "{{\"employee_id\": \"EMP10234\", \"short_description\": null, \"detailed_description\": null, \"first_observed\": null, \"troubleshooting_steps_tried\": null}}\n"
      "\n"
-     "Input: Its 123\n"
-     "{{\"employee_id\": \"123\", \"short_description\": null, \"detailed_description\": null}}\n"
+     "Input: I'm getting an Authentication Failed error while connecting\n"
+     "{{\"detailed_description\": \"Authentication Failed error while connecting\", \"short_description\": \"Authentication Failed error\", \"employee_id\": null, \"first_observed\": null, \"troubleshooting_steps_tried\": null}}\n"
      "\n"
-     "Input: abc@company.com\n"
-     "{{\"employee_email\": \"abc@company.com\", \"employee_id\": null, \"short_description\": null}}\n"
+     "Input: It started this morning\n"
+     "{{\"first_observed\": \"this morning\", \"employee_id\": null, \"detailed_description\": null, \"troubleshooting_steps_tried\": null}}\n"
      "\n"
-     "Input: Hyderabad\n"
-     "{{\"location\": \"Hyderabad\", \"employee_id\": null, \"short_description\": null}}\n"
+     "Input: Yes I've already tried restarting and reconnecting but it didn't work\n"
+     "{{\"troubleshooting_steps_tried\": \"restarted, tried reconnecting\", \"employee_id\": null, \"detailed_description\": null, \"first_observed\": null}}\n"
      "\n"
-     "Input: VDI not working\n"
-     "{{\"short_description\": \"VDI not working\", \"detailed_description\": null, \"employee_id\": null}}\n"
+     "Input: High priority\n"
+     "{{\"priority\": \"High\", \"employee_id\": null, \"detailed_description\": null, \"first_observed\": null, \"troubleshooting_steps_tried\": null}}\n"
      "\n"
-     "Input: After entering credentials the VDI keeps loading and never opens, Sometimes its giving me, load on vdi machine is too much, try again later\n"
-     "{{\"short_description\": \"VDI stuck loading after login\", \"detailed_description\": \"After entering credentials the VDI keeps loading and never opens, Sometimes its giving me, load on vdi machine is too much, try again later\", \"employee_id\": null}}\n"
+     "Input: It's blocking my work so High\n"
+     "{{\"priority\": \"High\", \"employee_id\": null, \"detailed_description\": null, \"first_observed\": null, \"troubleshooting_steps_tried\": null}}\n"
      ),
     ("human", "{text}")
 ]) | llm_struct
@@ -424,37 +497,77 @@ extract_chain = ChatPromptTemplate.from_messages([
 
 question_chain = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a voice assistant helping raise a support ticket.\n"
-     "Ask ONE polite, short, voice-friendly question. Max 12 words.\n"
-     "No format questions. Be natural and conversational.\n"
+     "You are an IT support voice assistant helping raise a support ticket.\n"
+     "You will be given what the user just said and the next field to collect.\n"
      "\n"
-     "Return ONLY a JSON object: {{\"question\": \"your question here\"}}\n"
+     "Generate a response that:\n"
+     "1. Starts with a brief, natural acknowledgment of what the user said (1-3 words).\n"
+     "   Use phrases like: 'Sure, I can help with that.', 'Thanks.', 'Understood.', 'Got it.', 'Of course.'.\n"
+     "   - For the very first message (greeting/issue report) use 'Sure, I can help with that.'\n"
+     "   - For factual inputs (IDs, emails) use 'Thanks.'\n"
+     "   - For problem descriptions use 'Understood.' or 'Got it.'\n"
+     "   - For time/steps inputs use 'Got it.' or 'Noted.'\n"
+     "2. Then asks ONE polite, short, voice-friendly question for the next field. Max 15 words.\n"
+     "\n"
+     "Field meanings:\n"
+     "- employee_id: the caller's employee ID\n"
+     "- detailed_description: the error or issue they are seeing\n"
+     "- first_observed: when they first noticed the problem\n"
+     "- troubleshooting_steps_tried: any steps they have already tried\n"
+     "- priority: how urgent the issue is (Low, Medium, or High)\n"
+     "\n"
+     "Return ONLY a JSON object: {{\"question\": \"acknowledgment + question here\"}}\n"
      "\n"
      "Examples:\n"
-     "{{\"question\": \"Could you briefly describe the issue you're facing?\"}}\n"
-     "{{\"question\": \"Please share your employee ID for ticket creation\"}}\n"
+     "User said: 'I'm unable to connect to VPN', Field: employee_id\n"
+     "{{\"question\": \"Sure, I can help with that. Could you please share your Employee ID?\"}}\n"
+     "\n"
+     "User said: 'EMP10234', Field: detailed_description\n"
+     "{{\"question\": \"Thanks. Could you briefly describe the issue or error you're seeing?\"}}\n"
+     "\n"
+     "User said: 'Getting Authentication Failed error', Field: first_observed\n"
+     "{{\"question\": \"Understood. When did you first notice this issue?\"}}\n"
+     "\n"
+     "User said: 'It started this morning', Field: troubleshooting_steps_tried\n"
+     "{{\"question\": \"Have you tried any basic troubleshooting steps like restarting or reconnecting?\"}}\n"
+     "\n"
+     "User said: 'Yes tried restarting but it didn't work', Field: priority\n"
+     "{{\"question\": \"Got it. Please confirm the priority — Low, Medium, or High?\"}}\n"
      ),
-    ("human", "Field: {field}")
+    ("human", "User said: '{last_user_message}'\nField: {field}")
 ]) | llm_struct
 
 
 intent_chain = ChatPromptTemplate.from_messages([
     ("system",
      "Classify the user message into exactly one of: greeting, unrelated, ticket.\n"
+     "\n"
      "Rules:\n"
      "- greeting: user says hello, hi, how are you, how can you help, etc.\n"
      "- ticket: user mentions a technical issue, problem, error, or request for help with a system\n"
-     "- unrelated: anything else not related to IT support\n"
+     "- ticket: user is replying to an agent question during an ongoing support conversation\n"
+     "- unrelated: anything else not related to IT support AND not a reply to an agent question\n"
+     "\n"
+     "IMPORTANT: If a conversation context is provided below, the user is mid-conversation\n"
+     "and their message is a direct reply to the agent's last question.\n"
+     "In that case you MUST classify as 'ticket' regardless of what the message looks like,\n"
+     "because bare answers like 'it's emp10234' or 'yesterday morning' only make sense\n"
+     "as replies to a specific agent question, not as standalone statements.\n"
      "\n"
      "Return ONLY a JSON object: {{\"intent\": \"greeting\"}} or {{\"intent\": \"ticket\"}} or {{\"intent\": \"unrelated\"}}\n"
      "\n"
-     "Examples:\n"
+     "Examples (no context):\n"
      "Hello, how can you help me? → {{\"intent\": \"greeting\"}}\n"
      "Hi there → {{\"intent\": \"greeting\"}}\n"
      "My VDI is not working → {{\"intent\": \"ticket\"}}\n"
      "What's the weather today? → {{\"intent\": \"unrelated\"}}\n"
+     "\n"
+     "Examples (with context):\n"
+     "Context: Agent asked 'Could you share your Employee ID?' | User: 'It's emp10234' → {{\"intent\": \"ticket\"}}\n"
+     "Context: Agent asked 'When did you first notice this issue?' | User: 'yesterday morning' → {{\"intent\": \"ticket\"}}\n"
+     "Context: Agent asked 'Could you describe the issue?' | User: 'VPN login fails' → {{\"intent\": \"ticket\"}}\n"
      ),
-    ("human", "{text}")
+    ("human", "{context}User message: {text}")
 ]) | llm_struct
 
 confirm_intent_chain = ChatPromptTemplate.from_messages([
@@ -475,33 +588,95 @@ confirm_intent_chain = ChatPromptTemplate.from_messages([
     ("human", "{text}")
 ]) | llm_struct
 
+# Fix 10: Strip leading filler / confirmation words before storing
+# troubleshooting steps so "yes, restarting" becomes "restarting".
+_TROUBLESHOOT_FILLER = re.compile(
+    r"^(yes[,.]?\s*|no[,.]?\s*|sure[,.]?\s*|okay[,.]?\s*|ok[,.]?\s*|"
+    r"well[,.]?\s*|so[,.]?\s*|i\s+have\s+|i've\s+|i\s+did\s+|"
+    r"i\s+already\s+|already\s+|i\s+tried\s+(to\s+)?|tried\s+(to\s+)?|"
+    r"i\s+have\s+tried\s+(to\s+)?|have\s+tried\s+(to\s+)?|i\s+)+",
+    re.IGNORECASE,
+)
+
+def _strip_troubleshoot_filler(text: str) -> str:
+    stripped = _TROUBLESHOOT_FILLER.sub("", text).strip().rstrip(".,")
+    # Fall back to original if stripping removed everything
+    return stripped if stripped else text.strip()
+
+
 # ============================================================
 # NODES
 # ============================================================
+
+_FAREWELL_KEYWORDS = [
+    "bye", "goodbye", "see you", "take care",
+    "thank you", "thanks", "have a good", "had a good",
+    "that's all", "that is all", "no more", "nothing else",
+    "all done", "i'm done", "im done", "have a nice",
+]
+_RESTART_KEYWORDS = [
+    "start over", "start again", "begin again", "from scratch",
+    "reset", "restart the conversation", "let's restart",
+]
 
 async def classify(state):
     state = ensure_state(state)
     logger.info("[NODE] classify — entry")
 
+    text = last_user(state).lower()
+
+    # Fix 6: Restart intent — must be checked first, before slots short-circuit,
+    # because slots are populated mid-conversation and would bypass this otherwise.
+    if any(k in text for k in _RESTART_KEYWORDS):
+        logger.info("[NODE] classify → restart (keyword match)")
+        return "restart"
+
+    # Fix 1: Farewell intent — must be checked before slots short-circuit.
+    # Without this, "goodbye" mid-conversation routes to ticket flow.
+    if any(k in text for k in _FAREWELL_KEYWORDS):
+        logger.info("[NODE] classify → farewell (keyword match)")
+        return "farewell"
+
     if state.get("awaiting_confirmation"):
         logger.info("[NODE] classify → handle_confirm (awaiting confirmation)")
         return "handle_confirm"
 
+    # Fix 2: Ticket already created — any follow-up message goes to farewell,
+    # not back into the ticket flow. Slot data is cleared by the create node.
+    if state.get("confirmed"):
+        logger.info("[NODE] classify → farewell (ticket already created)")
+        return "farewell"
+
     if state.get("slots") and any(state["slots"].values()):
         logger.info("[NODE] classify → ticket (slots already populated)")
         return "ticket"
-
-    text = last_user(state).lower()
 
     keywords = ["not working", "issue", "problem", "error", "fail", "can't", "not able"]
     if any(k in text for k in keywords):
         logger.info("[NODE] classify → ticket (keyword match)")
         return "ticket"
 
-    res = await intent_chain.ainvoke({"text": text})
+    # Build conversation context for the LLM so it can classify mid-conversation
+    # replies correctly. Without context, "it's emp10234" looks unrelated to the LLM.
+    # With context ("agent asked: Could you share your Employee ID?"), it's clearly
+    # a direct answer and the LLM will classify it as "ticket".
+    context = ""
+    pending = state.get("pending_field")
+    if pending:
+        last_agent_q = ""
+        for m in reversed(state.get("messages", [])):
+            if isinstance(m, AIMessage) and m.content.strip():
+                last_agent_q = m.content.strip()
+                break
+        if last_agent_q:
+            context = f"Conversation context: Agent asked '{last_agent_q}' (collecting: {pending})\n"
+        else:
+            context = f"Conversation context: Agent is collecting '{pending}' from the user.\n"
+
+    res = await intent_chain.ainvoke({"text": text, "context": context})
     parsed = parse_structured_json(res.content, ClassifyIntent)
     intent = parsed.intent.lower().strip()
-    logger.info(f"[NODE] classify — LLM intent='{intent}'")
+    logger.info(f"[NODE] classify — LLM intent='{intent}' (context={'yes' if context else 'none'})")
 
     if intent == "greeting":
         logger.info("[NODE] classify → greeting (LLM intent)")
@@ -515,12 +690,34 @@ async def classify(state):
 
 async def greeting(state):
     logger.info("[NODE] greeting — sending welcome message")
-    return {"messages": [AIMessage(content="Hi! I can take care of creating your ServiceNow ticket. Could you describe the issue you're facing?")]}
+    return {"messages": [AIMessage(content="Hi! I'm your IT Support Assistant. How can I help you today?")]}
 
 
 async def unrelated(state):
     logger.info("[NODE] unrelated — redirecting to ticket flow")
     return {"messages": [AIMessage(content="Hi! I can take care of creating your ServiceNow ticket. Could you describe the issue you're facing?")]}
+
+
+async def farewell(state):
+    # Fix 1 & 2: single node handles both mid-conversation farewells and
+    # post-ticket thank-yous so the agent always ends gracefully.
+    logger.info("[NODE] farewell — ending conversation")
+    return {"messages": [AIMessage(content="Thank you for reaching out. Goodbye, and have a great day!")]}
+
+
+async def restart(state):
+    # Fix 6: clear all collected data and invite the user to start fresh.
+    # Returning empty slots and reset flags means classify will treat the
+    # next message as a brand-new conversation.
+    logger.info("[NODE] restart — clearing state and restarting")
+    return {
+        "slots": {},
+        "pending_field": None,
+        "awaiting_confirmation": False,
+        "confirmed": False,
+        "field_to_update": None,
+        "messages": [AIMessage(content="Sure, let's start over. How can I help you today?")],
+    }
 
 
 async def extract(state):
@@ -540,6 +737,20 @@ async def extract(state):
                 "messages": [AIMessage(content=f"Please provide new {field.replace('_',' ')}.")]
             }
 
+    # Handle negative/nil answers for troubleshooting_steps_tried to break the loop
+    _NO_STEPS_PHRASES = {"no", "none", "nothing", "nope", "n/a", "no steps", "haven't tried", "did not try", "not tried"}
+    _pending = state.get("pending_field")
+    if _pending == "troubleshooting_steps_tried":
+        _text_norm = text.strip().lower().rstrip(".")
+        if _text_norm in _NO_STEPS_PHRASES or _text_norm.startswith("no,") or _text_norm == "no i haven't":
+            logger.info("[NODE] extract — user indicated no troubleshooting steps, setting to 'None'")
+            slots = dict(state.get("slots", {}))
+            slots["troubleshooting_steps_tried"] = "None"
+            slots = enforce_description_rules(slots, text, pending_field=_pending)
+            slots = await infer_missing_fields(slots)
+            pending = get_pending(slots)
+            return {"slots": slots, "pending_field": pending, "awaiting_confirmation": False}
+
     res = await extract_chain.ainvoke({"text": text})
     extracted = parse_structured_json(res.content, TicketSlots)
     logger.info(f"[NODE] extract — extracted slots: {extracted.model_dump()}")
@@ -551,13 +762,14 @@ async def extract(state):
             continue
         val = v.strip()
 
-        # Validate before storing — reject obviously wrong values early
-        if k == "employee_id" and not is_valid_employee_id(val):
-            logger.info(f"[NODE] extract — skipping invalid employee_id: '{val}'")
-            continue
-        if k == "employee_email" and not is_valid_email(val):
-            logger.info(f"[NODE] extract — skipping invalid employee_email: '{val}'")
-            continue
+        # Validate before storing — reject obviously wrong values early.
+        # Fix 4: Also normalise employee_id (strip hyphens/spaces) before storing
+        # so "E-123" and "E 123" are stored as "E123".
+        if k == "employee_id":
+            val = re.sub(r"[\s\-]", "", val.upper())
+            if not is_valid_employee_id(val):
+                logger.info(f"[NODE] extract — skipping invalid employee_id: '{val}'")
+                continue
 
         # Allow overwrite ONLY for explicit update request
         if state.get("field_to_update") == k:
@@ -565,14 +777,18 @@ async def extract(state):
             logger.info(f"[NODE] extract — overwrite field '{k}' = '{val}'")
             continue
 
-        # Prevent overwrite of existing valid values
+        # Prevent overwrite of existing valid values.
+        # Fix 3: Exception — if we are still actively collecting employee_id
+        # (pending_field == "employee_id"), allow the user to correct themselves
+        # ("wait, it's EMP456 not EMP123") without needing an explicit update request.
         existing = slots.get(k)
         if existing:
             existing_valid = True
             if k == "employee_id":
                 existing_valid = is_valid_employee_id(existing)
-            elif k == "employee_email":
-                existing_valid = is_valid_email(existing)
+                if existing_valid and _pending == "employee_id":
+                    # Still in collection phase — user may be self-correcting
+                    existing_valid = False
             if existing_valid:
                 continue
 
@@ -580,7 +796,33 @@ async def extract(state):
 
     state["field_to_update"] = None
 
-    slots = enforce_description_rules(slots, text)
+    # ── Fix 1: Don't prefill description fields before employee_id is collected ──
+    # The user's first message often describes the problem. If we store
+    # detailed_description immediately, get_pending() will skip asking for it
+    # explicitly. We only keep it once employee_id is confirmed in slots.
+    if not slots.get("employee_id"):
+        slots.pop("detailed_description", None)
+        slots.pop("short_description", None)
+        logger.info("[NODE] extract — employee_id not yet collected; discarding premature description fields")
+
+    # Prefer raw text when LLM under-extracts troubleshooting steps.
+    # Fix 10: Also strip leading filler words ("yes, I tried restarting" → "restarting").
+    if _pending == "troubleshooting_steps_tried":
+        raw_words = len(text.split())
+        extracted_val = slots.get("troubleshooting_steps_tried", "")
+        extracted_words = len(extracted_val.split()) if extracted_val else 0
+        if not extracted_val or (raw_words >= 4 and extracted_words < raw_words * 0.5):
+            cleaned = _strip_troubleshoot_filler(text)
+            slots["troubleshooting_steps_tried"] = cleaned
+            logger.info(
+                f"[NODE] extract — raw-text override for troubleshooting_steps_tried "
+                f"(extracted '{extracted_val}' → cleaned '{cleaned}')"
+            )
+        elif extracted_val:
+            # Even when LLM extraction looks good, strip filler from what it returned
+            slots["troubleshooting_steps_tried"] = _strip_troubleshoot_filler(extracted_val)
+
+    slots = enforce_description_rules(slots, text, pending_field=_pending)
     slots = await infer_missing_fields(slots)
 
     if slots.get("detailed_description") and not slots.get("short_description"):
@@ -611,14 +853,15 @@ def route_after_extract(state):
 async def ask(state):
     state = ensure_state(state)
     field = state.get("pending_field")
+    user_text = last_user(state)
     logger.info(f"[NODE] ask — prompting for field='{field}'")
 
     try:
-        res = await question_chain.ainvoke({"field": field})
+        res = await question_chain.ainvoke({"field": field, "last_user_message": user_text})
         parsed = parse_structured_json(res.content, QuestionOutput)
         question = parsed.question.strip()
 
-        if "format" in question.lower() or len(question.split()) > 12:
+        if "format" in question.lower() or len(question.split()) > 25:
             logger.info(f"[NODE] ask — LLM question rejected, using fallback for '{field}'")
             question = fallback_question(field)
 
@@ -702,12 +945,25 @@ async def create(state):
     try:
         ticket_id = await snow_client.create_ticket(slots)
         logger.info(f"[NODE] create — ticket created successfully: {ticket_id}")
+        # Fix 9 & Fix 2: Reset all state after successful ticket creation.
+        # - Clearing slots + confirmed means classify treats the next message fresh.
+        # - The success message asks if there's another issue so the user can
+        #   naturally start a second ticket or say goodbye.
         return {
+            "slots": {},
+            "pending_field": None,
+            "awaiting_confirmation": False,
+            "confirmed": False,
+            "field_to_update": None,
             "messages": [
                 AIMessage(
-                    content=f"Ticket created successfully. Ticket ID: {ticket_id}"
+                    content=(
+                        f"Thanks. Your ticket {ticket_id} has been created successfully. "
+                        "Our IT team will reach out shortly. "
+                        "Is there anything else I can help you with?"
+                    )
                 )
-            ]
+            ],
         }
 
     except Exception as e:
@@ -733,6 +989,8 @@ def build_agent():
 
     g.add_node("greeting", greeting)
     g.add_node("unrelated", unrelated)
+    g.add_node("farewell", farewell)   # Fix 1 & 2
+    g.add_node("restart", restart)     # Fix 6
     g.add_node("extract", extract)
     g.add_node("ask", ask)
     g.add_node("confirm", confirm)
@@ -742,12 +1000,16 @@ def build_agent():
     g.add_conditional_edges(START, classify, {
         "greeting": "greeting",
         "unrelated": "unrelated",
+        "farewell": "farewell",
+        "restart": "restart",
         "ticket": "extract",
-        "handle_confirm": "handle_confirm"
+        "handle_confirm": "handle_confirm",
     })
 
     g.add_edge("greeting", END)
     g.add_edge("unrelated", END)
+    g.add_edge("farewell", END)
+    g.add_edge("restart", END)
 
     g.add_edge("confirm", END)
 

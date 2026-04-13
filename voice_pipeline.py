@@ -30,12 +30,36 @@ logger = logging.getLogger(__name__)
 # Prevents echo / network delay from instantly cancelling the agent.
 BARGE_IN_GRACE_MS = 700
 
+# Minimum number of words in an interim transcript before barge-in fires.
+# Prevents a single "um", cough, or noise burst from interrupting TTS.
+BARGE_IN_MIN_WORDS = 2
+
+# After a speech_final chunk arrives, wait this long (seconds) before launching
+# the agent. If more speech arrives in this window, accumulate and reset.
+# This prevents the agent firing mid-sentence on short pauses (<400ms).
+AGENT_LAUNCH_DEBOUNCE_S = 0.40
+
 
 # Maps spoken digit words (including common STT variants) to digit characters.
 _DIGIT_WORDS: dict[str, str] = {
     "zero": "0", "oh": "0",
     "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
+# Fix 8: NATO phonetic alphabet → single uppercase letter.
+# Users often spell out their employee IDs phonetically over the phone
+# (e.g. "Echo Mike one two three" → "EM123").
+# Only single-letter phonetic words are mapped so normal words like
+# "golf" in "golf tournament" are unaffected when not part of an ID run.
+_PHONETIC_ALPHABET: dict[str, str] = {
+    "alpha": "A", "bravo": "B", "charlie": "C", "delta": "D",
+    "echo": "E", "foxtrot": "F", "golf": "G", "hotel": "H",
+    "india": "I", "juliet": "J", "kilo": "K", "lima": "L",
+    "mike": "M", "november": "N", "oscar": "O", "papa": "P",
+    "quebec": "Q", "romeo": "R", "sierra": "S", "tango": "T",
+    "uniform": "U", "victor": "V", "whiskey": "W", "xray": "X",
+    "yankee": "Y", "zulu": "Z",
 }
 
 # Multi-word spoken phrases → their symbol/text equivalents.
@@ -89,6 +113,12 @@ def _normalize_transcript(text: str) -> str:
     lower = re.sub(r"\s*\.\s*", ".", lower)
     lower = re.sub(r"\s*_\s*", "_", lower)
     lower = re.sub(r"\s*-\s*", "-", lower)
+
+    # Step 1.5: NATO phonetic alphabet → single letter.
+    # Convert each token individually so normal multi-word sentences are unaffected.
+    # "echo mike 1 2 3" → "E M 1 2 3" → later merged to "EM123" in Step 3.
+    tokens = [_PHONETIC_ALPHABET.get(tok, tok) for tok in lower.split()]
+    lower = " ".join(tokens)
 
     tokens = lower.split()
 
@@ -165,9 +195,15 @@ class VoicePipeline:
 
         # Barge-in is a two-step process:
         #   1. speech_start → arm (if grace period passed)
-        #   2. interim/final transcript → fire (confirms real speech, not noise/echo)
-        # This prevents background noise / TTS echo from triggering barge-in.
+        #   2. interim/final transcript with >= BARGE_IN_MIN_WORDS → fire
+        # This prevents noise/echo/single-word sounds from interrupting TTS.
         self._barge_in_armed: bool = False
+
+        # Issue 1: debounce agent launch across speech_final chunks.
+        # Accumulates partial finals; agent only fires after AGENT_LAUNCH_DEBOUNCE_S
+        # of silence or on UtteranceEnd, so mid-sentence pauses don't trigger it.
+        self._pending_transcript: str = ""
+        self._agent_debounce_task: Optional[asyncio.Task] = None
 
     # ── Top-level runner ─────────────────────────────────────────────────────
 
@@ -258,13 +294,20 @@ class VoicePipeline:
                     logger.debug(
                         f"Interim [{event.get('confidence', 0):.2f}]: {transcript}"
                     )
-                    # Fire armed barge-in only when real speech content is confirmed
-                    if self._barge_in_armed and self._is_speaking and transcript:
+                    # FIX 2: Only fire barge-in when BARGE_IN_MIN_WORDS words are
+                    # confirmed. A single "um", noise burst, or TTS echo won't
+                    # satisfy this threshold, preventing premature TTS cutoff.
+                    word_count = len(transcript.split())
+                    if (
+                        self._barge_in_armed
+                        and self._is_speaking
+                        and word_count >= BARGE_IN_MIN_WORDS
+                    ):
                         elapsed_tts_ms = (
                             time.monotonic() - self._tts_audio_start_time
                         ) * 1000
                         logger.info(
-                            f"BARGE-IN detected (interim transcript confirmed, "
+                            f"BARGE-IN detected (interim {word_count} words confirmed, "
                             f"TTS had been playing {elapsed_tts_ms:.0f}ms)"
                         )
                         self._barge_in_armed = False
@@ -288,17 +331,67 @@ class VoicePipeline:
                         await self._handle_barge_in()
                     self._barge_in_armed = False
 
-                    logger.info(f"Final transcript: '{transcript}'")
+                    logger.info(f"Final transcript chunk: '{transcript}'")
                     elapsed = (time.monotonic() - self._turn_start_time) * 1000
                     logger.info(f"STT->final latency: {elapsed:.0f}ms")
-
                     self._turn_start_time = time.monotonic()
-                    self._launch_agent(transcript)
+
+                    # FIX 1: Accumulate transcript chunks and debounce agent launch.
+                    # speech_final fires on 200ms pauses which can be mid-sentence.
+                    # We wait AGENT_LAUNCH_DEBOUNCE_S; if more speech arrives the
+                    # timer resets and the new chunk is appended.
+                    self._pending_transcript = (
+                        (self._pending_transcript + " " + transcript).strip()
+                        if self._pending_transcript else transcript
+                    )
+                    if self._agent_debounce_task and not self._agent_debounce_task.done():
+                        self._agent_debounce_task.cancel()
+                    self._agent_debounce_task = asyncio.create_task(
+                        self._debounced_agent_launch()
+                    )
+
+                elif event["type"] == "utterance_end":
+                    # Deepgram confirmed >= utterance_end_ms (1000ms) of silence.
+                    # The user has definitely stopped — launch immediately without
+                    # waiting for the debounce timer.
+                    if self._pending_transcript:
+                        if (
+                            self._agent_debounce_task
+                            and not self._agent_debounce_task.done()
+                        ):
+                            self._agent_debounce_task.cancel()
+                            self._agent_debounce_task = None
+                        transcript = self._pending_transcript
+                        self._pending_transcript = ""
+                        logger.info(
+                            f"UtteranceEnd — launching agent immediately: '{transcript}'"
+                        )
+                        self._launch_agent(transcript)
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"STT event handler error: {e}")
+
+    # ── Debounced agent launch ───────────────────────────────────────────────
+
+    async def _debounced_agent_launch(self):
+        """
+        Wait AGENT_LAUNCH_DEBOUNCE_S seconds, then launch the agent with the
+        accumulated pending transcript. If cancelled (more speech arrives),
+        the pending_transcript is kept so the next chunk can append to it.
+        """
+        try:
+            await asyncio.sleep(AGENT_LAUNCH_DEBOUNCE_S)
+            if self._pending_transcript:
+                transcript = self._pending_transcript
+                self._pending_transcript = ""
+                logger.info(
+                    f"Debounce elapsed — launching agent: '{transcript}'"
+                )
+                self._launch_agent(transcript)
+        except asyncio.CancelledError:
+            pass  # more speech arrived; pending_transcript preserved for next chunk
 
     # ── Agent launcher & runner ──────────────────────────────────────────────
 
@@ -481,6 +574,11 @@ class VoicePipeline:
         never from raw media packets.
         """
         self._cancel_buffer_timer()
+        # Cancel any pending debounce so a stale transcript doesn't re-launch
+        if self._agent_debounce_task and not self._agent_debounce_task.done():
+            self._agent_debounce_task.cancel()
+            self._agent_debounce_task = None
+        self._pending_transcript = ""
         if self._agent_task and not self._agent_task.done():
             self._agent_task.cancel()
         await self.ws.send_json(
@@ -531,6 +629,8 @@ class VoicePipeline:
 
     async def cleanup(self):
         self._cancel_buffer_timer()
+        if self._agent_debounce_task:
+            self._agent_debounce_task.cancel()
         if self._agent_task:
             self._agent_task.cancel()
         self._should_stop = True
